@@ -1,5 +1,5 @@
-//go:build linux
-// +build linux
+//// go:build linux
+//// +build linux
 
 package nftables
 
@@ -67,6 +67,38 @@ func (n *nft) Add(decision *models.Decision) error {
 	return nil
 }
 
+func (n *nft) Set(decisions []*models.Decision) (added int, deleted int, err error) {
+	banned, err := n.getBannedState()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get current state: %w", err)
+	}
+
+	// Map for fast lookup and decide what to add
+	dm := make(map[string]*models.Decision, len(decisions))
+	for _, d := range decisions {
+		dm[*d.Value] = d
+
+		if _, ok := banned[*d.Value]; !ok {
+			n.Add(d)
+			added++
+		}
+	}
+
+	// Check which we need to delete
+	for ip, _ := range banned {
+		if dm[ip] == nil {
+			ip := strings.Clone(ip)
+			n.Delete(&models.Decision{
+				Value: &ip,
+			})
+
+			deleted++
+		}
+	}
+
+	return
+}
+
 func (n *nft) getBannedState() (map[string]struct{}, error) {
 	banned := make(map[string]struct{})
 	if err := n.v4.setBanned(banned); err != nil {
@@ -86,27 +118,19 @@ func (n *nft) reset() {
 }
 
 func (n *nft) commitDeletedDecisions() error {
-	banned, err := n.getBannedState()
-	if err != nil {
-		return fmt.Errorf("failed to get current state: %w", err)
-	}
-
 	ip4 := []nftables.SetElement{}
 	ip6 := []nftables.SetElement{}
 
-	n.decisionsToDelete = normalizedDecisions(n.decisionsToDelete)
-
 	for _, decision := range n.decisionsToDelete {
 		ip := net.ParseIP(*decision.Value)
-		if _, ok := banned[ip.String()]; !ok {
-			log.Debugf("not deleting %s since it's not in the set", ip)
+		if ip == nil {
+			log.Errorf("Unable to parse %s as IP", *decision.Value)
 			continue
 		}
 
-		if strings.Contains(ip.String(), ":") {
+		if ip.To4() == nil {
 			if n.v6.conn != nil {
-				log.Tracef("adding %s to buffer", ip)
-
+				log.Tracef("adding %s to buffer (v6)", ip)
 				ip6 = append(ip6, nftables.SetElement{Key: ip.To16()})
 			}
 
@@ -114,8 +138,7 @@ func (n *nft) commitDeletedDecisions() error {
 		}
 
 		if n.v4.conn != nil {
-			log.Tracef("adding %s to buffer", ip)
-
+			log.Tracef("adding %s to buffer (v4)", ip)
 			ip4 = append(ip4, nftables.SetElement{Key: ip.To4()})
 		}
 	}
@@ -140,11 +163,6 @@ func (n *nft) commitDeletedDecisions() error {
 }
 
 func (n *nft) commitAddedDecisions() error {
-	banned, err := n.getBannedState()
-	if err != nil {
-		return fmt.Errorf("failed to get current state: %w", err)
-	}
-
 	ip4 := []nftables.SetElement{}
 	ip6 := []nftables.SetElement{}
 
@@ -152,17 +170,16 @@ func (n *nft) commitAddedDecisions() error {
 
 	for _, decision := range n.decisionsToAdd {
 		ip := net.ParseIP(*decision.Value)
-		if _, ok := banned[ip.String()]; ok {
-			log.Debugf("not adding %s since it's already in the set", ip)
+		if ip == nil {
+			log.Errorf("Unable to parse %s as IP", *decision.Value)
 			continue
 		}
 
 		t, _ := time.ParseDuration(*decision.Duration)
 
-		if strings.Contains(ip.String(), ":") {
+		if ip.To4() == nil {
 			if n.v6.conn != nil {
 				log.Tracef("adding %s to buffer", ip)
-
 				ip6 = append(ip6, nftables.SetElement{Timeout: t, Key: ip.To16()})
 			}
 
@@ -171,7 +188,6 @@ func (n *nft) commitAddedDecisions() error {
 
 		if n.v4.conn != nil {
 			log.Tracef("adding %s to buffer", ip)
-
 			ip4 = append(ip4, nftables.SetElement{Timeout: t, Key: ip.To4()})
 		}
 	}
